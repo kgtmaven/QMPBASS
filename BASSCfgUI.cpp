@@ -7,6 +7,7 @@
 #include "bass.h"
 
 #include <tchar.h>
+#include <process.h>
 
 const unsigned int PREAMP_RANGE = 24;
 LPCTSTR resolution_table[] = { "16 bit", "24 bit", "32 bit" };
@@ -813,20 +814,182 @@ INT_PTR CALLBACK AboutDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPa
 
 
 //-- for stream saving bar
-void ShowStreamSavingBar(BOOL bShow)
-{
-	if (bShow)
-		UpdateSSBarStatus(hwndStreamSavingBar);
+#define WM_QMPBASS_SSB_SHOW       (WM_APP + 0x351)
+#define WM_QMPBASS_SSB_UPDATE     (WM_APP + 0x352)
+#define WM_QMPBASS_SSB_THREADSTOP (WM_APP + 0x353)
 
-	SetWindowPos(hwndStreamSavingBar, HWND_TOPMOST, xStreamSavingBar, yStreamSavingBar, 0, 0, SWP_NOSIZE);
-	ShowWindow(hwndStreamSavingBar, (bShow) ? SW_SHOW : SW_HIDE);
-
-	return;
-}
-
-static HWND hwndToolTip = NULL;
+static HANDLE g_hStreamBarThread = NULL;
+static HANDLE g_hStreamBarReadyEvent = NULL;
+static DWORD g_dwStreamBarThreadId = 0;
+static volatile LONG g_lStreamBarStopping = 0;
+static TCHAR g_szStreamSavingOn[32] = { 0 };
+static TCHAR g_szStreamSavingOff[32] = { 0 };
+static TCHAR g_szStreamSavingTooltip[64] = { 0 };
+static TCHAR g_szStreamSavingTooltipStatus[64] = { 0 };
+static TCHAR g_szSavingFolderTitle[64] = { 0 };
 static char szToolTip[3*MAX_PATH] = {'\0'};
 static HIMAGELIST himlStreamSavingBar = NULL;
+static HWND hwndToolTip = NULL;
+
+static void ShowStreamSavingBarNow(HWND hwndDlg, BOOL bShow);
+static void UpdateSSBarStatusNow(HWND hwndDlg);
+static unsigned __stdcall StreamSavingBarThreadProc(void *pParam);
+
+BOOL StartStreamSavingBar(void)
+{
+	LPCDLGTEMPLATE pTemplate;
+	uintptr_t threadHandle;
+	unsigned int threadId = 0;
+	DWORD waitResult;
+
+	if (g_hStreamBarThread)
+		return (hwndStreamSavingBar != NULL);
+
+	InterlockedExchange(&g_lStreamBarStopping, 0);
+	hwndStreamSavingBar = NULL;
+
+	// Resolve host-provided resources on the caller thread before creating the
+	// dedicated UI thread.  The dialog template pointer is then used immediately
+	// by that thread during CreateDialogIndirect.
+	pTemplate = LoadResDialog(hInstance, IDD_STREAM_SAVING_BAR);
+	if (!pTemplate) {
+		return FALSE;
+	}
+
+	// Cache localized strings before the UI thread starts.  The dialog thread
+	// does not need to call back into QCD merely to refresh its labels/tooltips.
+	LoadResString(hInstance, IDS_STREAM_SAVING_ON, g_szStreamSavingOn, sizeof(g_szStreamSavingOn));
+	LoadResString(hInstance, IDS_STREAM_SAVING_OFF, g_szStreamSavingOff, sizeof(g_szStreamSavingOff));
+	LoadResString(hInstance, IDS_STREAM_SAVING_TOOLTIP, g_szStreamSavingTooltip, sizeof(g_szStreamSavingTooltip));
+	LoadResString(hInstance, IDS_STREAM_SAVING_TOOLTIP_STATUS, g_szStreamSavingTooltipStatus, sizeof(g_szStreamSavingTooltipStatus));
+	LoadResString(hInstance, IDS_SAVING_FOLDER_TITLE, g_szSavingFolderTitle, sizeof(g_szSavingFolderTitle));
+
+	g_hStreamBarReadyEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+	if (!g_hStreamBarReadyEvent) {
+		return FALSE;
+	}
+
+	threadHandle = _beginthreadex(NULL, 0, StreamSavingBarThreadProc,
+		(void *)pTemplate, 0, &threadId);
+	if (!threadHandle) {
+		CloseHandle(g_hStreamBarReadyEvent);
+		g_hStreamBarReadyEvent = NULL;
+		return FALSE;
+	}
+	g_hStreamBarThread = (HANDLE)threadHandle;
+	g_dwStreamBarThreadId = (DWORD)threadId;
+
+	waitResult = WaitForSingleObject(g_hStreamBarReadyEvent, 10000);
+	CloseHandle(g_hStreamBarReadyEvent);
+	g_hStreamBarReadyEvent = NULL;
+
+	if (waitResult != WAIT_OBJECT_0 || !hwndStreamSavingBar) {
+		StopStreamSavingBar();
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+void StopStreamSavingBar(void)
+{
+
+	if (!g_hStreamBarThread)
+		return;
+
+	InterlockedExchange(&g_lStreamBarStopping, 1);
+
+	if (GetCurrentThreadId() == g_dwStreamBarThreadId) {
+		// This should not normally happen because QCD's ShutDown callback is
+		// external to the private UI thread.  Avoid waiting on ourselves.
+		if (hwndStreamSavingBar)
+			SendMessage(hwndStreamSavingBar, WM_CLOSE, 0, 0);
+		else
+			PostQuitMessage(0);
+		return;
+	}
+
+	if (!PostThreadMessage(g_dwStreamBarThreadId, WM_QMPBASS_SSB_THREADSTOP, 0, 0)) {
+		if (hwndStreamSavingBar)
+			PostMessage(hwndStreamSavingBar, WM_CLOSE, 0, 0);
+	}
+
+	// The private thread has its own message loop, so it can destroy its window
+	// without depending on the QCD thread currently executing ShutDown.
+	WaitForSingleObject(g_hStreamBarThread, INFINITE);
+
+	CloseHandle(g_hStreamBarThread);
+	g_hStreamBarThread = NULL;
+	g_dwStreamBarThreadId = 0;
+	hwndStreamSavingBar = NULL;
+}
+
+static unsigned __stdcall StreamSavingBarThreadProc(void *pParam)
+{
+	MSG msg;
+	int messageResult;
+	LPCDLGTEMPLATE pTemplate = (LPCDLGTEMPLATE)pParam;
+
+	// Force creation of this thread's message queue before the caller posts stop.
+	PeekMessage(&msg, NULL, WM_USER, WM_USER, PM_NOREMOVE);
+	hwndStreamSavingBar = CreateDialogIndirect(hInstance, pTemplate, NULL,
+		(DLGPROC)StreamSavingBarProc);
+
+	if (g_hStreamBarReadyEvent)
+		SetEvent(g_hStreamBarReadyEvent);
+
+	if (!hwndStreamSavingBar) {
+		PostQuitMessage(0);
+	} else {
+		while ((messageResult = GetMessage(&msg, NULL, 0, 0)) > 0) {
+			if (msg.hwnd == NULL && msg.message == WM_QMPBASS_SSB_THREADSTOP) {
+				if (hwndStreamSavingBar)
+					SendMessage(hwndStreamSavingBar, WM_CLOSE, 0, 0);
+				else
+					PostQuitMessage(0);
+				continue;
+			}
+
+			if (hwndStreamSavingBar && IsDialogMessage(hwndStreamSavingBar, &msg))
+				continue;
+
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
+		}
+	}
+
+	hwndStreamSavingBar = NULL;
+	return 0;
+}
+
+void ShowStreamSavingBar(BOOL bShow)
+{
+	HWND hwndDlg = hwndStreamSavingBar;
+	DWORD ownerThread;
+
+	if (!hwndDlg || InterlockedCompareExchange(&g_lStreamBarStopping, 0, 0))
+		return;
+
+	ownerThread = GetWindowThreadProcessId(hwndDlg, NULL);
+	if (ownerThread != GetCurrentThreadId()) {
+		PostMessage(hwndDlg, WM_QMPBASS_SSB_SHOW, (WPARAM)bShow, 0);
+		return;
+	}
+
+	ShowStreamSavingBarNow(hwndDlg, bShow);
+}
+
+static void ShowStreamSavingBarNow(HWND hwndDlg, BOOL bShow)
+{
+	if (!hwndDlg)
+		return;
+
+	if (bShow)
+		UpdateSSBarStatusNow(hwndDlg);
+
+	SetWindowPos(hwndDlg, HWND_TOPMOST, xStreamSavingBar, yStreamSavingBar, 0, 0, SWP_NOSIZE);
+	ShowWindow(hwndDlg, bShow ? SW_SHOW : SW_HIDE);
+}
 
 void InitStreamSavingBar(HWND hwndDlg)
 {
@@ -877,25 +1040,37 @@ void InitStreamSavingBar(HWND hwndDlg)
 
 void UpdateSSBarStatus(HWND hwndDlg)
 {
-	TCHAR buf1[32], buf2[32];
+	DWORD ownerThread;
 
-	// Avoid shutdown race
-	if (!bStreamSaveBarVisible)
+	if (!hwndDlg)
+		hwndDlg = hwndStreamSavingBar;
+	if (!hwndDlg || InterlockedCompareExchange(&g_lStreamBarStopping, 0, 0))
 		return;
 
-	LoadResString(hInstance, IDS_STREAM_SAVING_ON, buf1, sizeof(buf1));
-	LoadResString(hInstance, IDS_STREAM_SAVING_OFF, buf2, sizeof(buf2));
+	ownerThread = GetWindowThreadProcessId(hwndDlg, NULL);
+	if (ownerThread != GetCurrentThreadId()) {
+		PostMessage(hwndDlg, WM_QMPBASS_SSB_UPDATE, 0, 0);
+		return;
+	}
 
-	SetDlgItemText(hwndDlg, IDC_STREAM_SAVING_BAR_STATUS, bStreamSaving ? buf1 :buf2);
+	UpdateSSBarStatusNow(hwndDlg);
+}
+
+static void UpdateSSBarStatusNow(HWND hwndDlg)
+{
+	// Avoid shutdown race
+	if (!hwndDlg || !bStreamSaveBarVisible)
+		return;
+
+	SetDlgItemText(hwndDlg, IDC_STREAM_SAVING_BAR_STATUS,
+		bStreamSaving ? g_szStreamSavingOn : g_szStreamSavingOff);
 
 	// Really need greyed out folder items in stream saving bar bitmap to display status correctly
-	EnableWindow(GetDlgItem(hwndDlg, IDC_STREAM_SAVING_BAR_SETPATH), !bStreamSaving); 
-	EnableWindow(GetDlgItem(hwndDlg, IDC_STREAM_SAVING_BAR_BROWSE), !bStreamSaving); 
+	EnableWindow(GetDlgItem(hwndDlg, IDC_STREAM_SAVING_BAR_SETPATH), !bStreamSaving);
+	EnableWindow(GetDlgItem(hwndDlg, IDC_STREAM_SAVING_BAR_BROWSE), !bStreamSaving);
 
 	// Set button status
 	EnableWindow(GetDlgItem(hwndDlg, IDC_STREAM_SAVING_BAR_SKIP_TITLE), bStreamSaving);
-
-	return;
 }
 
 
@@ -907,6 +1082,14 @@ INT_PTR CALLBACK StreamSavingBarProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPA
 
 	switch (uMsg) 
 	{
+	case WM_QMPBASS_SSB_SHOW:
+		ShowStreamSavingBarNow(hwndDlg, (BOOL)wParam);
+		return TRUE;
+
+	case WM_QMPBASS_SSB_UPDATE:
+		UpdateSSBarStatusNow(hwndDlg);
+		return TRUE;
+
 	case WM_NCHITTEST:
 		{
 			RECT rc;
@@ -946,13 +1129,9 @@ INT_PTR CALLBACK StreamSavingBarProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPA
 							decoderInfo.pDecoder->m_strCurTitle &&
 							*decoderInfo.pDecoder->m_strCurTitle)
 						{
-							TCHAR buf[64];
-							LoadResString(hInstance, IDS_STREAM_SAVING_TOOLTIP, buf, sizeof(buf));
-							wsprintf(szToolTip, buf, decoderInfo.pDecoder->m_strCurTitle, (LPCTSTR)strStreamSavingPath);
+							wsprintf(szToolTip, g_szStreamSavingTooltip, decoderInfo.pDecoder->m_strCurTitle, (LPCTSTR)strStreamSavingPath);
 						} else {
-							TCHAR buf[64];
-							LoadResString(hInstance, IDS_STREAM_SAVING_TOOLTIP_STATUS, buf, sizeof(buf));
-							lstrcpy(szToolTip, buf);
+							lstrcpy(szToolTip, g_szStreamSavingTooltipStatus);
 						}
 
 						lpttd->lpszText = szToolTip;
@@ -1016,11 +1195,9 @@ INT_PTR CALLBACK StreamSavingBarProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPA
 					break;
 				case IDC_STREAM_SAVING_BAR_SETPATH:
 					{
-						TCHAR buf[50];
 						TCHAR szBuffer[MAX_PATH];
 
-						LoadResString(hInstance, IDS_SAVING_FOLDER_TITLE, buf, sizeof(buf));
-						if ( browse_folder(szBuffer, buf, hwndDlg) && lstrcmpi(strStreamSavingPath, szBuffer))
+						if ( browse_folder(szBuffer, g_szSavingFolderTitle, hwndDlg) && lstrcmpi(strStreamSavingPath, szBuffer))
 							lstrcpy((LPTSTR)(LPCTSTR)strStreamSavingPath, szBuffer);
 					}
 
@@ -1056,7 +1233,7 @@ INT_PTR CALLBACK StreamSavingBarProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPA
 			xStreamSavingBar = rc.left;
 			yStreamSavingBar = rc.top;
 
-			DestroyWindow(hwndStreamSavingBar);
+			DestroyWindow(hwndDlg);
 		}
 
 		return TRUE;
@@ -1065,7 +1242,7 @@ INT_PTR CALLBACK StreamSavingBarProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPA
 		// We are done - signal waiter if DLL unload
 		hwndStreamSavingBar = NULL;
 
-		return TRUE;
+		return FALSE;
 
 	case WM_DESTROY:
 		{
@@ -1078,9 +1255,10 @@ INT_PTR CALLBACK StreamSavingBarProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPA
 				DestroyWindow(hwndToolTip);
 				hwndToolTip = NULL;
 			}
+			PostQuitMessage(0);
 		}
 
-		return TRUE;
+		return FALSE;
 	}
 	
 	return FALSE; 

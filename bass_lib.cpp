@@ -113,8 +113,8 @@ bool create_bass (DWORD device, HWND hPlayer)
 bool destroy_bass (void)
 {
 	free_addons(0); // free all addons
-
-	return BASS_Free() ? true : false;
+	BOOL result = BASS_Free();
+	return result ? true : false;
 }
 
 // strdup and fixup legal file name

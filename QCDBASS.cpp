@@ -135,14 +135,6 @@ int WINAPI DllMain(HINSTANCE hInst, DWORD fdwReason, LPVOID pRes)
 	if (fdwReason == DLL_PROCESS_DETACH) {
 		_ASSERTE(hwndConfig == NULL);
 		_ASSERTE(hwndStreamSavingBar == NULL);
-
-		while (hwndStreamSavingBar) {
-			MSG msg;
-			if (!PeekMessage(&msg, hwndStreamSavingBar, 0, 0, PM_REMOVE))
-				break;
-			TranslateMessage(&msg);
-			DispatchMessage(&msg);
-		}
 	}
 	return TRUE;
 }
@@ -224,22 +216,24 @@ int Initialize(QCDModInfo *ModInfo, int flags)
 
 
 	// Init BASS
-	if (create_bass(uDeviceNum, hwndPlayer))
+	if (create_bass(uDeviceNum, hwndPlayer)) {
 		uCurDeviceNum = uDeviceNum;
-	else
+	}
+	else {
 		return FALSE;
+	}
 
 	strAllExtensions = strAddonExtensions;
 	strAllExtensions.append(":");
 	strAllExtensions.append(strExtensions);
 
-	ModInfo->moduleString      = "QPlugins BASS Sound System v2.1.4+kgtmaven-v0.1";
+	ModInfo->moduleString      = "QPlugins BASS Sound System v2.1.4+kgtmaven-v0.2";
 	ModInfo->moduleExtensions  = (LPSTR)strAllExtensions.c_str();
 	ModInfo->moduleCategory    = "AUDIO";
 
 	// Create stream saving bar
-	hwndStreamSavingBar = CreateDialogIndirect(hInstance, LoadResDialog(hInstance, IDD_STREAM_SAVING_BAR), NULL, (DLGPROC)StreamSavingBarProc);
-	ShowStreamSavingBar(bStreamSaveBarVisible);
+	if (StartStreamSavingBar())
+		ShowStreamSavingBar(bStreamSaveBarVisible);
 
 	// insert plug-in menu
 	insert_menu();
@@ -265,9 +259,7 @@ void ShutDown(int flags)
 	}
 
 	// Remove SSBar and get location, etc.
-	if(hwndStreamSavingBar) {
-		SendMessage(hwndStreamSavingBar, WM_CLOSE, 0, 0);
-	}
+	StopStreamSavingBar();
 
 	// save config
 	char inifile[MAX_PATH];
