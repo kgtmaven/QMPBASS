@@ -227,7 +227,7 @@ int Initialize(QCDModInfo *ModInfo, int flags)
 	strAllExtensions.append(":");
 	strAllExtensions.append(strExtensions);
 
-	ModInfo->moduleString      = "QPlugins BASS Sound System v2.1.4+kgtmaven-v0.2";
+	ModInfo->moduleString      = "QPlugins BASS Sound System v2.1.4+kgtmaven-v0.3";
 	ModInfo->moduleExtensions  = (LPSTR)strAllExtensions.c_str();
 	ModInfo->moduleCategory    = "AUDIO";
 
@@ -446,7 +446,7 @@ int Play(const char* medianame, int playfrom, int playto, int flags)
 		decoderInfo.playingFile = _strdup(medianame);
 	}
 
-	decoderInfo.killThread = 0;
+	InterlockedExchange(&decoderInfo.killThread, 0);
 	seek_to = playfrom;
 
 	SetEQ(NULL);
@@ -481,11 +481,15 @@ int Play(const char* medianame, int playfrom, int playto, int flags)
 int Stop(const char* medianame, int flags)
 {
 	if ( medianame && decoderInfo.playingFile && !lstrcmpi(decoderInfo.playingFile, medianame) ) {
-		if (decoderInfo.pDecoder->is_decode) // stop output first for decoding
+		InterlockedExchange(&decoderInfo.killThread, 1);
+
+		if (decoderInfo.pDecoder && decoderInfo.pDecoder->is_decode) {
+			if (QCDCallbacks.toPlayer.OutputDrainCancel)
+				QCDCallbacks.toPlayer.OutputDrainCancel(flags);
 			QCDCallbacks.toPlayer.OutputStop(flags);
+		}
 
 		// destroy play/decoding thread
-		decoderInfo.killThread = 1;
 		if (decoderInfo.thread_handle != INVALID_HANDLE_VALUE) {
 			if (WaitForSingleObject(decoderInfo.thread_handle, 5000) == WAIT_TIMEOUT) {
 				OutputDebugString("*** Forced thread termination!\n");
@@ -495,7 +499,8 @@ int Stop(const char* medianame, int flags)
 			decoderInfo.thread_handle = INVALID_HANDLE_VALUE;
 		}
 
-		decoderInfo.pDecoder->stop(flags); // stop all
+		if (decoderInfo.pDecoder)
+			decoderInfo.pDecoder->stop(flags); // stop all
 
 		reset_decoder();
 
@@ -788,7 +793,7 @@ DWORD WINAPI __stdcall PlayThread(void *b)
 		return 0;
 	}
 
-	while (!decoderInfo->killThread) {
+	while (InterlockedCompareExchange(&decoderInfo->killThread, 0, 0) == 0) {
 		/********************** SEEK ************************/
 		if (!done && seek_to >= 0) {
 			INT64 ms = seek_to;
@@ -805,11 +810,15 @@ DWORD WINAPI __stdcall PlayThread(void *b)
 
 		/********************* QUIT *************************/
 		if (done) { // only available when playdone or output error
-			if (seek_to < 0) {
+			if (seek_to < 0 &&
+				InterlockedCompareExchange(&decoderInfo->killThread, 0, 0) == 0) {
 				decoderInfo->pDecoder->stop(STOPFLAG_PLAYDONE);
-				QCDCallbacks.toPlayer.PlayDone(decoderInfo->playingFile, STOPFLAG_PLAYDONE);
+				// A manual stop may have arrived while the decoder was stopping.
+				if (InterlockedCompareExchange(&decoderInfo->killThread, 0, 0) == 0)
+					QCDCallbacks.toPlayer.PlayDone(decoderInfo->playingFile, STOPFLAG_PLAYDONE);
 			}
-			else if (seek_to >= 0) {
+			else if (seek_to >= 0 &&
+				InterlockedCompareExchange(&decoderInfo->killThread, 0, 0) == 0) {
 				done = FALSE;
 				continue;
 			}
@@ -876,7 +885,7 @@ DWORD WINAPI __stdcall PlayThread(void *b)
 		}
 
 		// catch pause ( Should be a semaphore )
-		while (paused && !decoderInfo->killThread)
+		while (paused && InterlockedCompareExchange(&decoderInfo->killThread, 0, 0) == 0)
 			Sleep(50);
 	}
 
@@ -949,7 +958,7 @@ DWORD WINAPI __stdcall DecodeThread(void *b)
 		return 0;
 	}
 
-	while (!decoderInfo->killThread) {
+	while (InterlockedCompareExchange(&decoderInfo->killThread, 0, 0) == 0) {
 		/********************** SEEK ************************/
 		if (!done && seek_to >= 0) {
 			INT64 ms = seek_to;
@@ -965,14 +974,20 @@ DWORD WINAPI __stdcall DecodeThread(void *b)
 		}
 
 		/********************* QUIT *************************/
-		if (done) { // only avaliable when playdone or output error
-			if (QCDCallbacks.toPlayer.OutputDrain(0) && seek_to < 0) {
-				QCDCallbacks.toPlayer.OutputStop(STOPFLAG_PLAYDONE);
-				QCDCallbacks.toPlayer.PlayDone(decoderInfo->playingFile, STOPFLAG_PLAYDONE);
-			}
-			else if (seek_to >= 0) {
-				done = FALSE;
-				continue;
+		if (done) { // only available when playdone or output error
+			if (InterlockedCompareExchange(&decoderInfo->killThread, 0, 0) == 0) {
+				int drainCompleted = QCDCallbacks.toPlayer.OutputDrain(0);
+				if (drainCompleted && seek_to < 0 &&
+					InterlockedCompareExchange(&decoderInfo->killThread, 0, 0) == 0) {
+					QCDCallbacks.toPlayer.OutputStop(STOPFLAG_PLAYDONE);
+					if (InterlockedCompareExchange(&decoderInfo->killThread, 0, 0) == 0)
+						QCDCallbacks.toPlayer.PlayDone(decoderInfo->playingFile, STOPFLAG_PLAYDONE);
+				}
+				else if (seek_to >= 0 &&
+					InterlockedCompareExchange(&decoderInfo->killThread, 0, 0) == 0) {
+					done = FALSE;
+					continue;
+				}
 			}
 			break;
 		}
@@ -1021,7 +1036,7 @@ DWORD WINAPI __stdcall DecodeThread(void *b)
 			if (ret == 0 || ret == -1) // error or reach the eof
 				done = TRUE;
 
-			if (!decoderInfo->killThread && ret > 0) { // Send to output
+			if (InterlockedCompareExchange(&decoderInfo->killThread, 0, 0) == 0 && ret > 0) { // Send to output
 				WriteDataStruct wd;
 
 				decode_pos_ms = decoderInfo->pDecoder->get_current_time();
@@ -1049,7 +1064,7 @@ DWORD WINAPI __stdcall DecodeThread(void *b)
 		}
 
 		// catch pause (use semaphore?)
-		while (paused && !decoderInfo->killThread)
+		while (paused && InterlockedCompareExchange(&decoderInfo->killThread, 0, 0) == 0)
 			Sleep(50);
 	}
 

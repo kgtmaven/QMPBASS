@@ -21,7 +21,7 @@ typedef struct
 {
 	bass		*pDecoder;
 	file_info	info;
-	int			killThread;
+	volatile LONG	killThread;
 	HANDLE		thread_handle;
 	char		*playingFile;
 } DecoderInfo_t;
