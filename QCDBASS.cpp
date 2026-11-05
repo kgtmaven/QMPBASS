@@ -152,7 +152,7 @@ int WINAPI DllMain(HINSTANCE hInst, DWORD fdwReason, LPVOID pRes)
 PLUGIN_API QCDModInitIn* INPUTDLL_ENTRY_POINT(QCDModInitIn *ModInit, QCDModInfo *ModInfo)
 {
 	QCDCallbacks.size						= sizeof(QCDModInitIn);
-	QCDCallbacks.version					= PLUGIN_API_VERSION;
+	QCDCallbacks.version					= PLUGIN_API_VERSION_NTUTF8;
 	QCDCallbacks.toModule.Initialize		= Initialize;
 	QCDCallbacks.toModule.ShutDown			= ShutDown;
 	QCDCallbacks.toModule.GetTrackExtents	= GetTrackExtents;
@@ -233,7 +233,7 @@ int Initialize(QCDModInfo *ModInfo, int flags)
 	strAllExtensions.append(":");
 	strAllExtensions.append(strExtensions);
 
-	ModInfo->moduleString      = "QPlugins BASS Sound System "PLUGIN_VERSION;
+	ModInfo->moduleString      = "QPlugins BASS Sound System v2.1.4+kgtmaven-v0.1";
 	ModInfo->moduleExtensions  = (LPSTR)strAllExtensions.c_str();
 	ModInfo->moduleCategory    = "AUDIO";
 

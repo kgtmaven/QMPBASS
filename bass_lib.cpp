@@ -10,6 +10,28 @@
 
 #include "tags.h"
 #include <atlstr.h>
+#include <stdlib.h>
+
+static WCHAR *qmp_utf8_path_to_wide(const char *path)
+{
+	if (!path || !*path)
+		return NULL;
+
+	int cch = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+	if (cch <= 0)
+		return NULL;
+
+	WCHAR *widePath = (WCHAR *)malloc(cch * sizeof(WCHAR));
+	if (!widePath)
+		return NULL;
+
+	if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, widePath, cch)) {
+		free(widePath);
+		return NULL;
+	}
+
+	return widePath;
+}
 
 #if !defined(timeGetTime)
 #define timeGetTime	GetTickCount
@@ -562,10 +584,26 @@ int bass::init ( bool fullinit )
 		} else
 			return 1;
 	} else { // for local file
-		m_hBass = BASS_StreamCreateFile(FALSE, m_strPath, 0, 0, 
-									(is_decode ? BASS_STREAM_DECODE : 0) | 
-									(use_32fp ? BASS_SAMPLE_FLOAT : 0));
+		WCHAR *widePath = NULL;
+		const void *bassPath = m_strPath;
+		DWORD unicodeFlag = 0;
+
+		if (IsUnicode()) {
+			widePath = qmp_utf8_path_to_wide(m_strPath);
+			if (!widePath)
+				return 0;
+			bassPath = widePath;
+			unicodeFlag = BASS_UNICODE;
+		}
+
+		m_hBass = BASS_StreamCreateFile(FALSE, bassPath, 0, 0,
+										(is_decode ? BASS_STREAM_DECODE : 0) |
+										(use_32fp ? BASS_SAMPLE_FLOAT : 0) |
+										unicodeFlag);
 		if (m_hBass) { // for mp* and wav files
+			if (widePath)
+				free(widePath);
+
 			size = BASS_StreamGetFilePosition(m_hBass, BASS_FILEPOS_END);
 			length = (DWORD)BASS_ChannelBytes2Seconds( m_hBass, BASS_ChannelGetLength(m_hBass, BASS_POS_BYTE) );
 
@@ -581,25 +619,34 @@ int bass::init ( bool fullinit )
 			}
 
 			return 1;
-		} else if ( (m_hBass = BASS_MusicLoad(FALSE, m_strPath, 0, 0, 
-			BASS_MUSIC_RAMPS | BASS_MUSIC_CALCLEN | 
-			(is_decode ? BASS_MUSIC_DECODE : 0) | 
-			(use_32fp ? BASS_SAMPLE_FLOAT : 0), 0)) ) { // for mod files
-				size = BASS_ChannelGetLength(m_hBass, BASS_POS_BYTE);
-				length = (DWORD)BASS_ChannelBytes2Seconds(m_hBass, size);
+		}
 
-				BASS_ChannelGetInfo(m_hBass, &ChannelInfo);
+		if ( (m_hBass = BASS_MusicLoad(FALSE, bassPath, 0, 0,
+			BASS_MUSIC_RAMPS | BASS_MUSIC_CALCLEN |
+			(is_decode ? BASS_MUSIC_DECODE : 0) |
+			(use_32fp ? BASS_SAMPLE_FLOAT : 0) |
+			unicodeFlag, 0)) ) { // for mod files
+			if (widePath)
+				free(widePath);
 
-				if (fullinit) {
-					init_rg(); // init replaygain
+			size = BASS_ChannelGetLength(m_hBass, BASS_POS_BYTE);
+			length = (DWORD)BASS_ChannelBytes2Seconds(m_hBass, size);
 
-					if (!is_decode)
-						BASS_ChannelSetDSP( m_hBass, &rg_dsp_proc, this, 1 ); // set our replaygain dsp for playback mode
-				}
+			BASS_ChannelGetInfo(m_hBass, &ChannelInfo);
 
-				return 1;
-		} else
-			return (BASS_ErrorGetCode() == BASS_ERROR_FILEFORM) ? -1 : 0;
+			if (fullinit) {
+				init_rg(); // init replaygain
+
+				if (!is_decode)
+					BASS_ChannelSetDSP( m_hBass, &rg_dsp_proc, this, 1 ); // set our replaygain dsp for playback mode
+			}
+
+			return 1;
+		}
+
+		if (widePath)
+			free(widePath);
+		return (BASS_ErrorGetCode() == BASS_ERROR_FILEFORM) ? -1 : 0;
 	}
 }
 
